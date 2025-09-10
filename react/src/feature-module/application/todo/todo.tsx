@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { Link } from "react-router-dom";
 import TodoModal from "../../../core/modals/todoModal";
 import ImageWithBasePath from "../../../core/common/imageWithBasePath";
@@ -55,14 +55,35 @@ const Todo = () => {
   const [selectedTodoToDelete, setSelectedTodoToDelete] = useState<string | null>(null);
   const [selectedTodoToEdit, setSelectedTodoToEdit] = useState<Todo | null>(null);
   const [selectedTodoToView, setSelectedTodoToView] = useState<Todo | null>(null);
-
-  const toggleTodo = async (todoId: string, currentCompleted: boolean) => {
+  
+  // Track pending toggles to prevent race conditions
+  const [pendingToggles, setPendingToggles] = useState<Set<string>>(new Set());
+  const [lastToggleTime, setLastToggleTime] = useState<Map<string, number>>(new Map());
+  
+  const toggleTodo = useCallback(async (todoId: string, currentCompleted: boolean) => {
     if (!socket) {
       console.error('Socket not available');
       return;
     }
 
+    // Prevent multiple simultaneous toggles for the same todo
+    if (pendingToggles.has(todoId)) {
+      console.log('Toggle already in progress for todo:', todoId);
+      return;
+    }
+
+    // Debounce rapid clicks (prevent multiple clicks within 300ms)
+    const now = Date.now();
+    const lastToggle = lastToggleTime.get(todoId);
+    if (lastToggle && now - lastToggle < 300) {
+      console.log('Toggle too rapid, ignoring');
+      return;
+    }
+
     try {
+      // Mark this todo as being toggled
+      setPendingToggles(prev => new Set(prev).add(todoId));
+      setLastToggleTime(prev => new Map(prev).set(todoId, now));
       const updateData = {
         id: todoId,
         completed: !currentCompleted
@@ -72,9 +93,24 @@ const Todo = () => {
 
       const handleResponse = (response: any) => {
         console.log('Update todo response received:', response);
+        
+        // Remove from pending toggles
+        setPendingToggles(prev => {
+          const newSet = new Set(prev);
+          newSet.delete(todoId);
+          return newSet;
+        });
+
         if (response.done) {
           console.log('Todo completion status updated successfully');
-          // The todos will be updated via the broadcast from the backend
+          // Update the todo with the confirmed state from server
+          setTodos(prevTodos => 
+            prevTodos.map(todo => 
+              todo._id === todoId 
+                ? { ...todo, completed: !currentCompleted, updatedAt: new Date().toISOString() }
+                : todo
+            )
+          );
         } else {
           console.error('Failed to update todo:', response.error);
           // Revert the change in UI if update failed
@@ -109,6 +145,11 @@ const Todo = () => {
       // Add timeout to prevent infinite loading
       setTimeout(() => {
         console.error("Update todo request timed out");
+        setPendingToggles(prev => {
+          const newSet = new Set(prev);
+          newSet.delete(todoId);
+          return newSet;
+        });
         if (socket) {
           socket.off("admin/dashboard/update-todo-response", handleResponse);
         }
@@ -124,6 +165,11 @@ const Todo = () => {
 
     } catch (error) {
       console.error('Error updating todo completion status:', error);
+      setPendingToggles(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(todoId);
+        return newSet;
+      });
       // Revert the change in UI if error occurred
       setTodos(prevTodos => 
         prevTodos.map(todo => 
@@ -133,7 +179,7 @@ const Todo = () => {
         )
       );
     }
-  };
+  }, [socket, pendingToggles, lastToggleTime]);
 
   // Fetch todos and statistics
   useEffect(() => {
@@ -149,7 +195,26 @@ const Todo = () => {
           const tags = Array.from(new Set(todosData.map((todo: Todo) => todo.tag).filter(Boolean))) as string[];
           setAvailableTags(tags);
     }
-    setLoading(false);
+        setLoading(false);
+      });
+
+      // Listen for individual todo updates from other users
+      (socket as any).on("admin/dashboard/todo-updated", (data: any) => {
+        if (data && data.todoId && data.todo) {
+          // Only update if the todo is not currently being toggled
+          if (!pendingToggles.has(data.todoId)) {
+            console.log('Accepting broadcast update for todo:', data.todoId);
+            setTodos(prevTodos => 
+              prevTodos.map(todo => 
+                todo._id === data.todoId 
+                  ? { ...todo, ...data.todo }
+                  : todo
+              )
+            );
+          } else {
+            console.log('Ignoring broadcast update for todo:', data.todoId, 'Currently being toggled');
+          }
+        }
       });
 
       // Fetch statistics
@@ -191,6 +256,11 @@ const Todo = () => {
         (socket as any).off("admin/dashboard/get-todos-response");
         (socket as any).off("admin/dashboard/get-todo-statistics-response");
         (socket as any).off("admin/dashboard/delete-todo-response");
+        (socket as any).off("admin/dashboard/todo-updated");
+        
+        // Cleanup state
+        setPendingToggles(new Set());
+        setLastToggleTime(new Map());
       };
     }
   }, [socket, activeFilter]);
@@ -250,19 +320,19 @@ const Todo = () => {
     }
   };
 
-  // Get filtered todos based on current filters
-  const getFilteredTodos = () => {
+  // Get filtered todos based on current filters (memoized for performance)
+  const getFilteredTodos = useMemo(() => {
     return todos.filter(todo => {
       const tagMatch = selectedTag === "all" || todo.tag?.toLowerCase() === selectedTag.toLowerCase();
       const dueDateMatch = !dueDateFilter || (todo.dueDate && new Date(todo.dueDate).toDateString() === new Date(dueDateFilter).toDateString());
       
       return tagMatch && dueDateMatch;
     });
-  };
+  }, [todos, selectedTag, dueDateFilter]);
 
   // Calculate statistics from filtered todos
   const calculateStats = () => {
-    const filteredTodos = getFilteredTodos();
+    const filteredTodos = getFilteredTodos;
     const total = filteredTodos.length;
     const completed = filteredTodos.filter(todo => todo.completed).length;
     const pending = total - completed;
@@ -740,9 +810,15 @@ const Todo = () => {
                                         <input
                                           className="form-check-input"
                                           type="checkbox"
-                                                  checked={todo.completed}
-                                                  onChange={() => toggleTodo(todo._id, todo.completed)}
+                                          checked={todo.completed}
+                                          disabled={pendingToggles.has(todo._id)}
+                                          onChange={() => toggleTodo(todo._id, todo.completed)}
                                         />
+                                        {pendingToggles.has(todo._id) && (
+                                          <div className="spinner-border spinner-border-sm ms-1" role="status">
+                                            <span className="visually-hidden">Updating...</span>
+                                          </div>
+                                        )}
                                       </div>
                                       <span className="me-2 d-flex align-items-center rating-select">
                                                 <i className={`ti ti-star${todo.completed ? '-filled filled' : ''}`} />

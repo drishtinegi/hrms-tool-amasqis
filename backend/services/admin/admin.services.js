@@ -2213,6 +2213,30 @@ export const deleteTodoPermanently = async (companyId, todoId) => {
   }
 };
 
+// Get single todo by ID
+export const getTodoById = async (companyId, todoId) => {
+  try {
+    const collections = getTenantCollections(companyId);
+    
+    const todo = await collections.todos.findOne({
+      _id: new ObjectId(todoId),
+      isDeleted: { $ne: true }
+    });
+
+    if (!todo) {
+      return { done: false, error: "Todo not found" };
+    }
+
+    return {
+      done: true,
+      data: todo,
+    };
+  } catch (error) {
+    console.error("Error fetching todo by ID:", error);
+    return { done: false, error: error.message };
+  }
+};
+
 // Get todo statistics
 export const getTodoStatistics = async (companyId, filter = "all") => {
   try {

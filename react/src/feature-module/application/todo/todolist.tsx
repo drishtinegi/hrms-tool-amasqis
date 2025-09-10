@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { Link } from "react-router-dom";
 import TodoModal from "../../../core/modals/todoModal";
 import ImageWithBasePath from "../../../core/common/imageWithBasePath";
@@ -45,14 +45,36 @@ const TodoList = () => {
   const [selectedTodoToDelete, setSelectedTodoToDelete] = useState<string | null>(null);
   const [selectedTodoToEdit, setSelectedTodoToEdit] = useState<Todo | null>(null);
   const [selectedTodoToView, setSelectedTodoToView] = useState<Todo | null>(null);
+  
+  // Track pending toggles to prevent race conditions
+  const [pendingToggles, setPendingToggles] = useState<Set<string>>(new Set());
+  const [lastToggleTime, setLastToggleTime] = useState<Map<string, number>>(new Map());
 
-  const toggleTodo = async (todoId: string, currentCompleted: boolean) => {
+  const toggleTodo = useCallback(async (todoId: string, currentCompleted: boolean) => {
     if (!socket) {
       console.error('Socket not available');
       return;
     }
 
+    // Prevent multiple simultaneous toggles for the same todo
+    if (pendingToggles.has(todoId)) {
+      console.log('Toggle already in progress for todo:', todoId);
+      return;
+    }
+
+    // Debounce rapid clicks (prevent multiple clicks within 300ms)
+    const now = Date.now();
+    const lastToggle = lastToggleTime.get(todoId);
+    if (lastToggle && now - lastToggle < 300) {
+      console.log('Toggle too rapid, ignoring');
+      return;
+    }
+
     try {
+      // Mark this todo as being toggled
+      setPendingToggles(prev => new Set(prev).add(todoId));
+      setLastToggleTime(prev => new Map(prev).set(todoId, now));
+
       const updateData = {
         id: todoId,
         completed: !currentCompleted
@@ -62,9 +84,24 @@ const TodoList = () => {
 
       const handleResponse = (response: any) => {
         console.log('Update todo response received:', response);
+        
+        // Remove from pending toggles
+        setPendingToggles(prev => {
+          const newSet = new Set(prev);
+          newSet.delete(todoId);
+          return newSet;
+        });
+
         if (response.done) {
           console.log('Todo completion status updated successfully');
-          // The todos will be updated via the broadcast from the backend
+          // Update the todo with the confirmed state from server
+          setTodos(prevTodos => 
+            prevTodos.map(todo => 
+              todo._id === todoId 
+                ? { ...todo, completed: !currentCompleted, updatedAt: new Date().toISOString() }
+                : todo
+            )
+          );
         } else {
           console.error('Failed to update todo:', response.error);
           // Revert the change in UI if update failed
@@ -99,6 +136,11 @@ const TodoList = () => {
       // Add timeout to prevent infinite loading
       setTimeout(() => {
         console.error("Update todo request timed out");
+        setPendingToggles(prev => {
+          const newSet = new Set(prev);
+          newSet.delete(todoId);
+          return newSet;
+        });
         if (socket) {
           socket.off("admin/dashboard/update-todo-response", handleResponse);
         }
@@ -114,6 +156,11 @@ const TodoList = () => {
 
     } catch (error) {
       console.error('Error updating todo completion status:', error);
+      setPendingToggles(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(todoId);
+        return newSet;
+      });
       // Revert the change in UI if error occurred
       setTodos(prevTodos => 
         prevTodos.map(todo => 
@@ -123,7 +170,7 @@ const TodoList = () => {
         )
       );
     }
-  };
+  }, [socket, pendingToggles, lastToggleTime]);
 
   // Handle tag filter change
   const handleTagChange = (tag: string) => {
@@ -288,8 +335,8 @@ const TodoList = () => {
     }
   };
 
-  // Get filtered and sorted todos
-  const getFilteredTodos = () => {
+  // Get filtered and sorted todos (memoized for performance)
+  const getFilteredTodos = useMemo(() => {
     let filteredTodos = todos.filter(todo => {
       const tagMatch = selectedTag === "all" || todo.tag?.toLowerCase() === selectedTag.toLowerCase();
       const assigneeMatch = selectedAssignee === "all" || (todo.assignedTo || todo.userId) === selectedAssignee;
@@ -362,7 +409,7 @@ const TodoList = () => {
     });
 
     return filteredTodos;
-  };
+  }, [todos, selectedTag, selectedAssignee, selectedStatus, dateRangeFilter, dueDateFilter, customDateRange, sortBy]);
 
   // Fetch todos
   useEffect(() => {
@@ -382,6 +429,25 @@ const TodoList = () => {
           setAvailableAssignees(assignees);
         }
         setLoading(false);
+      });
+
+      // Listen for individual todo updates from other users
+      (socket as any).on("admin/dashboard/todo-updated", (data: any) => {
+        if (data && data.todoId && data.todo) {
+          // Only update if the todo is not currently being toggled
+          if (!pendingToggles.has(data.todoId)) {
+            console.log('Accepting broadcast update for todo:', data.todoId);
+            setTodos(prevTodos => 
+              prevTodos.map(todo => 
+                todo._id === data.todoId 
+                  ? { ...todo, ...data.todo }
+                  : todo
+              )
+            );
+          } else {
+            console.log('Ignoring broadcast update for todo:', data.todoId, 'Currently being toggled');
+          }
+        }
       });
 
       // Listen for todo creation success
@@ -416,6 +482,11 @@ const TodoList = () => {
         (socket as any).off("admin/dashboard/add-todo-response");
         (socket as any).off("admin/dashboard/update-todo-response");
         (socket as any).off("admin/dashboard/delete-todo-response");
+        (socket as any).off("admin/dashboard/todo-updated");
+        
+        // Cleanup state
+        setPendingToggles(new Set());
+        setLastToggleTime(new Map());
       };
     }
   }, [socket, activeFilter]);
@@ -541,7 +612,7 @@ const TodoList = () => {
               <div className="card-header d-flex align-items-center justify-content-between flex-wrap row-gap-3">
                 <h5 className="d-flex align-items-center">
                   Todo Lists{" "}
-                  <span className="badge bg-soft-pink ms-2">{getFilteredTodos().length} Todos</span>
+                  <span className="badge bg-soft-pink ms-2">{getFilteredTodos.length} Todos</span>
                 </h5>
                 <div className="d-flex align-items-center flex-wrap row-gap-3">
                   <div className="dropdown me-3">
@@ -990,14 +1061,14 @@ const TodoList = () => {
                           </div>
                         </td>
                       </tr>
-                      ) : getFilteredTodos().length === 0 ? (
+                      ) : getFilteredTodos.length === 0 ? (
                         <tr>
                           <td colSpan={9} className="text-center py-4 text-muted">
                             No todos found.
                         </td>
                       </tr>
                       ) : (
-                        getFilteredTodos().map((todo: Todo, index: number) => {
+                        getFilteredTodos.map((todo: Todo, index: number) => {
                           const progressPercentage = getProgressPercentage(todo);
                           return (
                             <tr key={todo._id}>
@@ -1008,8 +1079,14 @@ const TodoList = () => {
                                       className="form-check-input" 
                                       type="checkbox" 
                                       checked={todo.completed}
+                                      disabled={pendingToggles.has(todo._id)}
                                       onChange={() => toggleTodo(todo._id, todo.completed)}
                                     />
+                                    {pendingToggles.has(todo._id) && (
+                                      <div className="spinner-border spinner-border-sm ms-1" role="status">
+                                        <span className="visually-hidden">Updating...</span>
+                                      </div>
+                                    )}
                             </div>
                             <span className="mx-2 d-flex align-items-center rating-select">
                                     <i className={`ti ti-star${todo.completed ? '-filled filled' : ''}`} />

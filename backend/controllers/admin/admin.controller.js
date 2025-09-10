@@ -651,16 +651,18 @@ socket.on("admin/users/delete", async (data) => {
 
         socket.emit("admin/dashboard/update-todo-response", result);
 
-        // Broadcast updated todos to admin room (get all todos for real-time sync)
-        const updatedTodos = await adminService.getTodos(
-          companyId,
-          userId,
-          "all"
-        );
-        io.to(`admin_room_${companyId}`).emit(
-          "admin/dashboard/get-todos-response",
-          updatedTodos
-        );
+        // Broadcast only to OTHER users in the room (not the one who made the change)
+        // This prevents the user's own changes from being overridden
+        setTimeout(async () => {
+          const updatedTodo = await adminService.getTodoById(companyId, todoData.id);
+          if (updatedTodo.done) {
+            // Broadcast to all users in the room EXCEPT the one who made the change
+            socket.to(`admin_room_${companyId}`).emit(
+              "admin/dashboard/todo-updated",
+              { todoId: todoData.id, todo: updatedTodo.data }
+            );
+          }
+        }, 200); // 200ms delay to allow optimistic update to settle
       } catch (error) {
         console.error("Error updating todo:", error);
         socket.emit("admin/dashboard/update-todo-response", {
