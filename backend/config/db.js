@@ -65,7 +65,21 @@ export const getTenantCollections = (tenantDbName) => {
     pipelines: db.collection("pipelines"),
     stages: db.collection("stages"),
     
+    //Chat Collections
+    conversations: db.collection("conversations"),
+    messages: db.collection("messages"),
+    
+    //Social Feed
+    socialFeeds: db.collection("socialFeeds"),
+    follows: db.collection("follows"),
+    hashtags: db.collection("hashtags"),
 
+       // hr employee section collection
+    hr: db.collection("hr"),   
+    permissions:  db.collection("permissions"),
+    policy: db.collection("policy"),
+    designations: db.collection("designations"),
+    assets: db.collection("assets"),
   };
 };
 
